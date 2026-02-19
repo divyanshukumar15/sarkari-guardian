@@ -3,8 +3,13 @@ Sarkari Job Scraper
 ====================
 Uses Serper API (Google Search) to discover new government job notifications,
 then Gemini AI to extract structured job data with strict accuracy validation.
-Only accepts official .gov.in / .nic.in domain sources.
-Deduplicates entries before pushing to the database.
+
+Accuracy Guarantees:
+  1. DOMAIN WHITELIST     — Only .gov.in / .nic.in URLs are processed.
+  2. STRICT JSON SCHEMA   — Gemini must return 'N/A' for any uncertain field.
+  3. VALIDATION LAYER     — Post-extraction check rejects weak/incomplete data.
+  4. HASH DEDUPLICATION   — MD5(title|org) prevents duplicate DB entries.
+  5. AUTO-EXPIRY          — Jobs past their last_date are archived automatically.
 """
 
 import os
@@ -14,6 +19,7 @@ import hashlib
 import re
 from datetime import datetime, date
 from typing import Optional
+from urllib.parse import urlparse
 import requests
 
 # ─── Logging Setup ─────────────────────────────────────────────────────────────
@@ -29,14 +35,22 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─── Config ────────────────────────────────────────────────────────────────────
-SERPER_API_KEY = os.environ["SERPER_API_KEY"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+SERPER_API_KEY  = os.environ["SERPER_API_KEY"]
+GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
+SUPABASE_URL    = os.environ["SUPABASE_URL"]
+SUPABASE_KEY    = os.environ["SUPABASE_SERVICE_KEY"]
 
+# ── 1. STRICT DOMAIN WHITELIST ──────────────────────────────────────────────
 ALLOWED_DOMAINS = (".gov.in", ".nic.in")
-GEMINI_MODEL = "gemini-1.5-flash"
-GEMINI_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+# Minimum number of non-N/A fields required to accept a job entry
+MIN_VALID_FIELDS = 3
+
+GEMINI_MODEL    = "gemini-1.5-flash"
+GEMINI_ENDPOINT = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
+)
 
 SEARCH_QUERIES = [
     "site:gov.in OR site:nic.in sarkari job vacancy 2025 notification",
@@ -51,23 +65,136 @@ SEARCH_QUERIES = [
     "site:crpf.gov.in recruitment notification 2025",
 ]
 
-# ─── Domain Verification ───────────────────────────────────────────────────────
+# ─── 1. Domain Whitelist ───────────────────────────────────────────────────────
 def is_official_domain(url: str) -> bool:
-    """Only allow .gov.in or .nic.in domains."""
-    return any(url.lower().replace("https://", "").replace("http://", "").split("/")[0].endswith(d) for d in ALLOWED_DOMAINS)
+    """
+    Strictly verify that a URL belongs to .gov.in or .nic.in.
+    Uses urllib.parse for robust parsing (handles http/https/www prefixes).
+    """
+    try:
+        hostname = urlparse(url).hostname or ""
+        return any(hostname.endswith(d) for d in ALLOWED_DOMAINS)
+    except Exception:
+        return False
 
 def extract_domain(url: str) -> str:
-    return url.replace("https://", "").replace("http://", "").split("/")[0]
+    try:
+        return urlparse(url).hostname or ""
+    except Exception:
+        return ""
 
-# ─── Deduplication ─────────────────────────────────────────────────────────────
+# ─── 2. Strict JSON Schema Prompt ──────────────────────────────────────────────
+EXTRACTION_PROMPT = """
+You are a strict, read-only government job data extractor.
+
+RULES — you MUST follow all of them:
+1. Return ONLY valid JSON. No markdown, no code fences, no explanation.
+2. If you are NOT 100% certain about a value, return "N/A". NEVER guess.
+3. Dates MUST be in YYYY-MM-DD format or "N/A" — never any other format.
+4. "posts" MUST be an integer string (e.g. "120") or "N/A".
+5. "category" MUST be exactly one of: "latest", "admit-card", "results", "archived".
+6. "tags" MUST be a JSON array of short lowercase strings (e.g. ["ssc","central"]).
+7. Do NOT infer data from the source domain name alone.
+
+Job Snippet:
+---
+{snippet}
+---
+Source URL: {url}
+Source Domain: {domain}
+
+Return EXACTLY this JSON structure (no extra keys):
+{{
+  "title": "Full official job title or N/A",
+  "organization": "Organization name or N/A",
+  "department": "Ministry or department or N/A",
+  "category": "latest|admit-card|results",
+  "posts": "Integer or N/A",
+  "last_date": "YYYY-MM-DD or N/A",
+  "notification_date": "YYYY-MM-DD or N/A",
+  "location": "State or All India or N/A",
+  "qualification": "Required qualification or N/A",
+  "age_limit": "Age range or N/A",
+  "salary": "Pay scale or N/A",
+  "tags": ["tag1", "tag2"]
+}}
+"""
+
+# ─── 3. Validation Layer ────────────────────────────────────────────────────────
+# Fields that count toward the minimum-valid-fields threshold
+SCORED_FIELDS = [
+    "title", "organization", "department",
+    "last_date", "location", "qualification",
+    "age_limit", "salary", "posts",
+]
+
+def validate_job_data(data: dict) -> tuple[bool, str]:
+    """
+    Post-Gemini validation layer.
+    Returns (is_valid: bool, reason: str).
+
+    Rules:
+    - title must not be N/A (hard requirement)
+    - organization must not be N/A (hard requirement)
+    - At least MIN_VALID_FIELDS non-N/A values among SCORED_FIELDS
+    - last_date, if present, must be a parseable YYYY-MM-DD
+    - category must be one of the allowed values
+    """
+    ALLOWED_CATEGORIES = {"latest", "admit-card", "results", "archived"}
+
+    # Hard requirements
+    if not data.get("title") or data["title"] == "N/A":
+        return False, "Missing required field: title"
+    if not data.get("organization") or data["organization"] == "N/A":
+        return False, "Missing required field: organization"
+
+    # Category check
+    category = data.get("category", "")
+    if category not in ALLOWED_CATEGORIES:
+        data["category"] = "latest"  # safe default
+
+    # Date format check
+    last_date_str = data.get("last_date", "N/A")
+    if last_date_str != "N/A":
+        try:
+            date.fromisoformat(last_date_str)
+        except ValueError:
+            return False, f"Invalid last_date format: {last_date_str}"
+
+    notif_date_str = data.get("notification_date", "N/A")
+    if notif_date_str and notif_date_str != "N/A":
+        try:
+            date.fromisoformat(notif_date_str)
+        except ValueError:
+            data["notification_date"] = None  # drop bad date silently
+
+    # Minimum populated fields
+    populated = sum(
+        1 for f in SCORED_FIELDS
+        if data.get(f) and data[f] != "N/A"
+    )
+    if populated < MIN_VALID_FIELDS:
+        return False, (
+            f"Too few valid fields ({populated}/{len(SCORED_FIELDS)}); "
+            f"minimum required: {MIN_VALID_FIELDS}"
+        )
+
+    return True, "OK"
+
+# ─── 4. Hash-based Deduplication ───────────────────────────────────────────────
 def make_job_id(title: str, organization: str) -> str:
-    """Generate a stable hash-based ID to prevent duplicates."""
+    """
+    Generate a stable 16-char MD5 hash of (title|organization).
+    This is the primary key used to prevent duplicate DB entries.
+    The hash is deterministic: same job from different scrape runs
+    always produces the same ID.
+    """
     raw = f"{title.lower().strip()}|{organization.lower().strip()}"
     return hashlib.md5(raw.encode()).hexdigest()[:16]
 
 # ─── Serper Search ─────────────────────────────────────────────────────────────
 def search_jobs(query: str, num: int = 10) -> list[dict]:
-    """Call Serper API to search Google and return organic results."""
+    """Call Serper API and return only results on official government domains."""
     try:
         resp = requests.post(
             "https://google.serper.dev/search",
@@ -77,50 +204,20 @@ def search_jobs(query: str, num: int = 10) -> list[dict]:
         )
         resp.raise_for_status()
         results = resp.json().get("organic", [])
-        # Filter to official domains only
         verified = [r for r in results if is_official_domain(r.get("link", ""))]
-        log.info(f"Query: '{query[:60]}' → {len(results)} results, {len(verified)} verified")
+        rejected = len(results) - len(verified)
+        log.info(
+            f"Query: '{query[:60]}' → {len(results)} results, "
+            f"{len(verified)} verified, {rejected} rejected (non-govt domain)"
+        )
         return verified
     except Exception as e:
         log.error(f"Serper search failed: {e}")
         return []
 
 # ─── Gemini Extraction ─────────────────────────────────────────────────────────
-EXTRACTION_PROMPT = """
-You are a strict government job data extractor. Extract structured data from the job notification snippet below.
-
-STRICT RULES:
-1. If you are NOT 100% certain about a field, return "N/A" — NEVER guess.
-2. Dates must be in YYYY-MM-DD format or "N/A".
-3. Posts must be a number or "N/A".
-4. Return ONLY valid JSON, no markdown, no explanation.
-
-Job Snippet:
----
-{snippet}
----
-Source URL: {url}
-Source Domain: {domain}
-
-Return this exact JSON structure:
-{{
-  "title": "Full official job title or N/A",
-  "organization": "Organization name or N/A",
-  "department": "Ministry or department or N/A",
-  "category": "latest|admit-card|results",
-  "posts": "Number or N/A",
-  "last_date": "YYYY-MM-DD or N/A",
-  "notification_date": "YYYY-MM-DD or N/A",
-  "location": "State/All India or N/A",
-  "qualification": "Required qualification or N/A",
-  "age_limit": "Age range or N/A",
-  "salary": "Pay scale or N/A",
-  "tags": ["tag1", "tag2"]
-}}
-"""
-
 def extract_with_gemini(snippet: str, url: str, domain: str) -> Optional[dict]:
-    """Use Gemini to extract structured job data with strict N/A policy."""
+    """Use Gemini with the strict schema prompt; parse and return JSON or None."""
     prompt = EXTRACTION_PROMPT.format(snippet=snippet[:2000], url=url, domain=domain)
     try:
         resp = requests.post(
@@ -130,10 +227,9 @@ def extract_with_gemini(snippet: str, url: str, domain: str) -> Optional[dict]:
         )
         resp.raise_for_status()
         text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-        # Strip any markdown code fences
+        # Strip any accidental markdown code fences
         text = re.sub(r"```json\s*|```\s*", "", text).strip()
-        data = json.loads(text)
-        return data
+        return json.loads(text)
     except json.JSONDecodeError as e:
         log.warning(f"Gemini returned invalid JSON for {url}: {e}")
         return None
@@ -143,7 +239,7 @@ def extract_with_gemini(snippet: str, url: str, domain: str) -> Optional[dict]:
 
 # ─── Database Operations ───────────────────────────────────────────────────────
 def get_existing_ids() -> set[str]:
-    """Fetch all existing job IDs from Supabase to prevent duplicates."""
+    """Fetch all existing job IDs from the DB for deduplication."""
     try:
         resp = requests.get(
             f"{SUPABASE_URL}/rest/v1/jobs?select=id",
@@ -160,7 +256,7 @@ def get_existing_ids() -> set[str]:
         return set()
 
 def archive_expired_jobs():
-    """Move jobs past their last_date to archived status."""
+    """Patch all jobs whose last_date has passed to status=expired."""
     today_str = date.today().isoformat()
     try:
         resp = requests.patch(
@@ -178,8 +274,8 @@ def archive_expired_jobs():
     except Exception as e:
         log.error(f"Failed to archive expired jobs: {e}")
 
-def upsert_job(job_data: dict):
-    """Insert a new job if it doesn't exist (no duplicates)."""
+def upsert_job(job_data: dict) -> bool:
+    """Insert a job row; silently ignores if the ID already exists."""
     try:
         resp = requests.post(
             f"{SUPABASE_URL}/rest/v1/jobs",
@@ -197,114 +293,135 @@ def upsert_job(job_data: dict):
         log.error(f"Failed to upsert job: {e}")
         return False
 
+# ─── Status Helper ─────────────────────────────────────────────────────────────
+def compute_status(last_date_str: str) -> str:
+    """Derive active / expiring / expired from the last application date."""
+    if last_date_str == "N/A" or not last_date_str:
+        return "active"
+    try:
+        days_left = (date.fromisoformat(last_date_str) - date.today()).days
+        if days_left < 0:
+            return "expired"
+        if days_left <= 5:
+            return "expiring"
+    except ValueError:
+        pass
+    return "active"
+
 # ─── Main Pipeline ─────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 60)
     log.info("Sarkari Job Scraper started")
-    log.info(f"Run time: {datetime.now().isoformat()}")
+    log.info(f"Run time : {datetime.now().isoformat()}")
+    log.info(f"Domain whitelist : {ALLOWED_DOMAINS}")
+    log.info(f"Min valid fields : {MIN_VALID_FIELDS}")
     log.info("=" * 60)
 
     # Step 1: Archive expired jobs
-    log.info("Step 1: Archiving expired jobs...")
+    log.info("Step 1: Archiving expired jobs …")
     archive_expired_jobs()
 
-    # Step 2: Fetch existing IDs for deduplication
-    log.info("Step 2: Fetching existing job IDs...")
+    # Step 2: Deduplication — fetch existing IDs
+    log.info("Step 2: Fetching existing job IDs …")
     existing_ids = get_existing_ids()
-    log.info(f"Found {len(existing_ids)} existing jobs in database")
+    log.info(f"  → {len(existing_ids)} existing jobs in database")
 
-    # Step 3: Search and extract
+    # Step 3: Search across all queries
     all_results: list[dict] = []
     for query in SEARCH_QUERIES:
-        results = search_jobs(query, num=10)
-        all_results.extend(results)
+        all_results.extend(search_jobs(query, num=10))
 
     # Deduplicate search results by URL
     seen_urls: set[str] = set()
-    unique_results = []
-    for r in all_results:
-        url = r.get("link", "")
-        if url not in seen_urls:
-            seen_urls.add(url)
-            unique_results.append(r)
-
+    unique_results = [
+        r for r in all_results
+        if not (r.get("link", "") in seen_urls or seen_urls.add(r.get("link", "")))  # type: ignore[func-returns-value]
+    ]
     log.info(f"Step 3: {len(unique_results)} unique verified URLs to process")
 
-    # Step 4: Extract & upsert
-    new_count = 0
-    skipped_count = 0
-    error_count = 0
+    # Step 4: Extract → Validate → Deduplicate → Upsert
+    new_count      = 0
+    skipped_dup    = 0
+    skipped_domain = 0
+    skipped_valid  = 0
+    error_count    = 0
 
     for result in unique_results:
-        url = result.get("link", "")
+        url     = result.get("link", "")
+        domain  = extract_domain(url)
         snippet = f"{result.get('title', '')} {result.get('snippet', '')}"
-        domain = extract_domain(url)
 
+        # ── Guard 1: domain whitelist (double-check after search filter) ──
+        if not is_official_domain(url):
+            log.warning(f"[DOMAIN REJECTED] {url}")
+            skipped_domain += 1
+            continue
+
+        # ── Gemini extraction ──────────────────────────────────────────────
         extracted = extract_with_gemini(snippet, url, domain)
-        if not extracted or extracted.get("title") == "N/A":
-            log.warning(f"Skipping (no valid data): {url}")
+        if not extracted:
+            log.warning(f"[GEMINI FAILED] {url}")
             error_count += 1
             continue
 
-        job_id = make_job_id(
-            extracted.get("title", ""),
-            extracted.get("organization", "")
-        )
-
-        if job_id in existing_ids:
-            log.debug(f"Duplicate, skipping: {extracted.get('title', '')[:60]}")
-            skipped_count += 1
+        # ── Guard 2: post-extraction validation layer ─────────────────────
+        is_valid, reason = validate_job_data(extracted)
+        if not is_valid:
+            log.warning(f"[VALIDATION FAILED] {reason} | {url}")
+            skipped_valid += 1
             continue
 
-        today = date.today()
+        # ── Guard 3: hash-based deduplication ─────────────────────────────
+        job_id = make_job_id(extracted["title"], extracted["organization"])
+        if job_id in existing_ids:
+            log.debug(f"[DUPLICATE] {extracted['title'][:60]}")
+            skipped_dup += 1
+            continue
+
+        # ── Build DB row ───────────────────────────────────────────────────
         last_date_str = extracted.get("last_date", "N/A")
-        status = "active"
-        if last_date_str != "N/A":
-            try:
-                last_date = date.fromisoformat(last_date_str)
-                days_left = (last_date - today).days
-                if days_left < 0:
-                    status = "expired"
-                elif days_left <= 5:
-                    status = "expiring"
-            except ValueError:
-                pass
+        notif_date    = extracted.get("notification_date")
+        if notif_date == "N/A":
+            notif_date = None
 
         job_row = {
-            "id": job_id,
-            "title": extracted.get("title", "N/A"),
-            "organization": extracted.get("organization", "N/A"),
-            "department": extracted.get("department", "N/A"),
-            "category": extracted.get("category", "latest"),
-            "status": status,
-            "posts": extracted.get("posts", "N/A"),
-            "last_date": last_date_str if last_date_str != "N/A" else None,
-            "notification_date": extracted.get("notification_date", None),
-            "source_url": url,
-            "source_domain": domain,
+            "id":                job_id,
+            "title":             extracted["title"],
+            "organization":      extracted["organization"],
+            "department":        extracted.get("department", "N/A"),
+            "category":          extracted.get("category", "latest"),
+            "status":            compute_status(last_date_str),
+            "posts":             extracted.get("posts", "N/A"),
+            "last_date":         last_date_str if last_date_str != "N/A" else None,
+            "notification_date": notif_date,
+            "source_url":        url,
+            "source_domain":     domain,
             "is_verified_source": True,
-            "location": extracted.get("location", "N/A"),
-            "qualification": extracted.get("qualification", "N/A"),
-            "age_limit": extracted.get("age_limit", "N/A"),
-            "salary": extracted.get("salary", "N/A"),
-            "tags": extracted.get("tags", []),
-            "scraped_at": datetime.now().isoformat(),
+            "location":          extracted.get("location", "N/A"),
+            "qualification":     extracted.get("qualification", "N/A"),
+            "age_limit":         extracted.get("age_limit", "N/A"),
+            "salary":            extracted.get("salary", "N/A"),
+            "tags":              extracted.get("tags", []),
+            "scraped_at":        datetime.now().isoformat(),
         }
 
         success = upsert_job(job_row)
         if success:
             new_count += 1
             existing_ids.add(job_id)
-            log.info(f"✓ Added: {extracted.get('title', '')[:70]}")
+            log.info(f"✓ Added  : {extracted['title'][:70]}")
         else:
             error_count += 1
+            log.error(f"✗ Upsert failed for: {extracted['title'][:70]}")
 
-    # Summary
+    # ── Summary ────────────────────────────────────────────────────────────────
     log.info("=" * 60)
     log.info("Scraper run complete:")
-    log.info(f"  ✓ New jobs added : {new_count}")
-    log.info(f"  ↩ Duplicates skipped: {skipped_count}")
-    log.info(f"  ✗ Errors/skipped : {error_count}")
+    log.info(f"  ✓ New jobs added        : {new_count}")
+    log.info(f"  ↩ Duplicates skipped    : {skipped_dup}")
+    log.info(f"  ✗ Domain rejected       : {skipped_domain}")
+    log.info(f"  ✗ Validation failed     : {skipped_valid}")
+    log.info(f"  ✗ Extraction errors     : {error_count}")
     log.info("=" * 60)
 
 
