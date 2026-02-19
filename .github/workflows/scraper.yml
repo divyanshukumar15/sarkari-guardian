@@ -2,9 +2,9 @@ name: Sarkari Job Scraper
 
 on:
   schedule:
-    # Runs every 12 hours at 6:00 AM and 6:00 PM UTC (11:30 AM and 11:30 PM IST)
+    # Runs every 12 hours — 6:00 AM & 6:00 PM UTC (11:30 AM & 11:30 PM IST)
     - cron: '0 6,18 * * *'
-  workflow_dispatch:  # Allow manual trigger from GitHub UI
+  workflow_dispatch:   # Manual trigger from GitHub UI (Actions tab → Run workflow)
 
 jobs:
   scrape-jobs:
@@ -29,20 +29,24 @@ jobs:
             ${{ runner.os }}-pip-
 
       - name: Install Python dependencies
-        run: |
-          pip install -r scraper/requirements.txt
+        run: pip install -r scraper/requirements.txt
 
+      # ── All secrets are read from GitHub Repository Secrets ──────────────
+      # Go to: Settings → Secrets and variables → Actions → New repository secret
+      #   GEMINI_API_KEY       — Google AI Studio  → https://aistudio.google.com/apikey
+      #   SERPER_API_KEY       — Serper Dev         → https://serper.dev/api-key
+      #   SUPABASE_URL         — Supabase project URL
+      #   SUPABASE_SERVICE_KEY — Supabase service role key (NOT the anon key)
       - name: Run Sarkari Job Scraper
         env:
-          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
+          SERPER_API_KEY:       ${{ secrets.SERPER_API_KEY }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: |
-          python scraper/main.py
+        run: python scraper/main.py
 
       - name: Upload scraper log as artifact
-        if: always()
+        if: always()   # Upload logs even if the scraper step fails
         uses: actions/upload-artifact@v4
         with:
           name: scraper-log-${{ github.run_id }}
