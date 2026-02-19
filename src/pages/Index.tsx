@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { mockJobs, getStats } from '@/data/mockJobs';
-import { Job, JobCategory } from '@/data/mockJobs';
+import { Job, JobCategory } from '@/types/job';
+import { useJobs, filterJobs, computeStats } from '@/hooks/useJobs';
 import JobCard from '@/components/JobCard';
 import StatsBar from '@/components/StatsBar';
 import SearchBar from '@/components/SearchBar';
@@ -13,6 +13,8 @@ import {
   Zap,
   RefreshCw,
   Shield,
+  Loader2,
+  AlertCircle,
 } from 'lucide-react';
 
 const TABS: { key: JobCategory; label: string; icon: React.ElementType }[] = [
@@ -25,23 +27,20 @@ const TABS: { key: JobCategory; label: string; icon: React.ElementType }[] = [
 const Index = () => {
   const [activeTab, setActiveTab] = useState<JobCategory>('latest');
   const [search, setSearch] = useState('');
-  const stats = getStats();
 
-  const filtered: Job[] = mockJobs
-    .filter(job => {
-      if (activeTab === 'archived') return job.status === 'expired' || job.category === 'archived';
-      return job.category === activeTab && job.status !== 'expired';
-    })
-    .filter(job => {
-      if (!search) return true;
-      const q = search.toLowerCase();
-      return (
-        job.title.toLowerCase().includes(q) ||
-        job.organization.toLowerCase().includes(q) ||
-        job.department.toLowerCase().includes(q) ||
-        job.tags.some(t => t.toLowerCase().includes(q))
-      );
-    });
+  const { data: jobs = [], isLoading, isError, dataUpdatedAt } = useJobs();
+
+  const stats = computeStats(jobs);
+  const filtered = filterJobs(jobs, activeTab, search);
+
+  const lastSyncText = dataUpdatedAt
+    ? new Date(dataUpdatedAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })
+    : '—';
+
+  const tabCount = (tab: JobCategory) => {
+    if (tab === 'archived') return jobs.filter(j => j.status === 'expired' || j.category === 'archived').length;
+    return jobs.filter(j => j.category === tab && j.status !== 'expired').length;
+  };
 
   return (
     <div className="min-h-screen" style={{ background: 'hsl(var(--background))' }}>
@@ -77,8 +76,8 @@ const Index = () => {
                 Auto-updated every 12 hours
               </span>
               <span className="flex items-center gap-1.5">
-                <RefreshCw className="w-3 h-3 text-green-400" />
-                Last sync: Just now
+                <RefreshCw className={`w-3 h-3 ${isLoading ? 'animate-spin text-amber-400' : 'text-green-400'}`} />
+                {isLoading ? 'Syncing…' : `Last sync: ${lastSyncText}`}
               </span>
             </div>
           </div>
@@ -147,11 +146,7 @@ const Index = () => {
                       activeTab === tab.key ? 'hsl(var(--primary))' : 'hsl(var(--muted-foreground))',
                   }}
                 >
-                  {mockJobs.filter(j =>
-                    tab.key === 'archived'
-                      ? j.status === 'expired' || j.category === 'archived'
-                      : j.category === tab.key && j.status !== 'expired'
-                  ).length}
+                  {tabCount(tab.key)}
                 </span>
               </button>
             ))}
@@ -181,19 +176,45 @@ const Index = () => {
           </div>
         )}
 
+        {/* Loading State */}
+        {isLoading && (
+          <div className="flex flex-col items-center justify-center py-20 text-muted-foreground gap-3">
+            <Loader2 className="w-10 h-10 animate-spin text-primary" />
+            <p className="text-sm font-medium">Loading live job data…</p>
+          </div>
+        )}
+
+        {/* Error State */}
+        {isError && !isLoading && (
+          <div className="flex flex-col items-center justify-center py-16 text-destructive gap-3">
+            <AlertCircle className="w-10 h-10" />
+            <p className="text-sm font-medium">Failed to load jobs. Please refresh the page.</p>
+          </div>
+        )}
+
         {/* Job Grid */}
-        {filtered.length > 0 ? (
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
-            {filtered.map(job => (
-              <JobCard key={job.id} job={job} />
-            ))}
-          </div>
-        ) : (
-          <div className="text-center py-16 text-muted-foreground">
-            <Briefcase className="w-12 h-12 mx-auto mb-4 opacity-30" />
-            <p className="text-lg font-display font-semibold">No jobs found</p>
-            <p className="text-sm mt-1">Try a different search term or category</p>
-          </div>
+        {!isLoading && !isError && (
+          <>
+            {filtered.length > 0 ? (
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
+                {filtered.map(job => (
+                  <JobCard key={job.id} job={job} />
+                ))}
+              </div>
+            ) : (
+              <div className="text-center py-16 text-muted-foreground">
+                <Briefcase className="w-12 h-12 mx-auto mb-4 opacity-30" />
+                <p className="text-lg font-display font-semibold">
+                  {jobs.length === 0 ? 'No jobs yet' : 'No jobs found'}
+                </p>
+                <p className="text-sm mt-1">
+                  {jobs.length === 0
+                    ? 'The scraper will populate jobs once the GitHub Action runs.'
+                    : 'Try a different search term or category'}
+                </p>
+              </div>
+            )}
+          </>
         )}
       </div>
 
