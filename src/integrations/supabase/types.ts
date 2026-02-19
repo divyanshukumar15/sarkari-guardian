@@ -14,7 +14,75 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      jobs: {
+        Row: {
+          age_limit: string | null
+          category: string
+          created_at: string
+          department: string | null
+          id: string
+          is_verified_source: boolean | null
+          last_date: string | null
+          location: string | null
+          notification_date: string | null
+          organization: string
+          posts: string | null
+          qualification: string | null
+          salary: string | null
+          scraped_at: string | null
+          source_domain: string | null
+          source_url: string | null
+          status: string
+          tags: string[] | null
+          title: string
+          updated_at: string
+        }
+        Insert: {
+          age_limit?: string | null
+          category?: string
+          created_at?: string
+          department?: string | null
+          id: string
+          is_verified_source?: boolean | null
+          last_date?: string | null
+          location?: string | null
+          notification_date?: string | null
+          organization: string
+          posts?: string | null
+          qualification?: string | null
+          salary?: string | null
+          scraped_at?: string | null
+          source_domain?: string | null
+          source_url?: string | null
+          status?: string
+          tags?: string[] | null
+          title: string
+          updated_at?: string
+        }
+        Update: {
+          age_limit?: string | null
+          category?: string
+          created_at?: string
+          department?: string | null
+          id?: string
+          is_verified_source?: boolean | null
+          last_date?: string | null
+          location?: string | null
+          notification_date?: string | null
+          organization?: string
+          posts?: string | null
+          qualification?: string | null
+          salary?: string | null
+          scraped_at?: string | null
+          source_domain?: string | null
+          source_url?: string | null
+          status?: string
+          tags?: string[] | null
+          title?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
