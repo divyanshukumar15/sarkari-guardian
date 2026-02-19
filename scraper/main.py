@@ -4,6 +4,12 @@ Sarkari Job Scraper
 Uses Serper API (Google Search) to discover new government job notifications,
 then Gemini AI to extract structured job data with strict accuracy validation.
 
+Architecture:
+  - Scraper searches Google via Serper API
+  - Gemini AI extracts structured job data from search snippets
+  - Job data is sent to the secure ingest-jobs Edge Function
+  - Edge Function writes to the database using service-role access
+
 Accuracy Guarantees:
   1. DOMAIN WHITELIST     — Only .gov.in / .nic.in URLs are processed.
   2. STRICT JSON SCHEMA   — Gemini must return 'N/A' for any uncertain field.
@@ -35,10 +41,17 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ─── Config ────────────────────────────────────────────────────────────────────
-SERPER_API_KEY  = os.environ["SERPER_API_KEY"]
-GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
-SUPABASE_URL    = os.environ["SUPABASE_URL"]
-SUPABASE_KEY    = os.environ["SUPABASE_SERVICE_KEY"]
+SERPER_API_KEY   = os.environ["SERPER_API_KEY"]
+GEMINI_API_KEY   = os.environ["GEMINI_API_KEY"]
+SCRAPER_API_KEY  = os.environ["SCRAPER_API_KEY"]
+SUPABASE_PROJECT = os.environ["SUPABASE_PROJECT_ID"]   # e.g. ivwctxktrtbvpuwbmtyv
+
+# Edge Function endpoint (no service role key needed — auth via SCRAPER_API_KEY)
+INGEST_URL = f"https://{SUPABASE_PROJECT}.supabase.co/functions/v1/ingest-jobs"
+INGEST_HEADERS = {
+    "Content-Type": "application/json",
+    "x-scraper-key": SCRAPER_API_KEY,
+}
 
 # ── 1. STRICT DOMAIN WHITELIST ──────────────────────────────────────────────
 ALLOWED_DOMAINS = (".gov.in", ".nic.in")
@@ -67,10 +80,6 @@ SEARCH_QUERIES = [
 
 # ─── 1. Domain Whitelist ───────────────────────────────────────────────────────
 def is_official_domain(url: str) -> bool:
-    """
-    Strictly verify that a URL belongs to .gov.in or .nic.in.
-    Uses urllib.parse for robust parsing (handles http/https/www prefixes).
-    """
     try:
         hostname = urlparse(url).hostname or ""
         return any(hostname.endswith(d) for d in ALLOWED_DOMAINS)
@@ -121,7 +130,6 @@ Return EXACTLY this JSON structure (no extra keys):
 """
 
 # ─── 3. Validation Layer ────────────────────────────────────────────────────────
-# Fields that count toward the minimum-valid-fields threshold
 SCORED_FIELDS = [
     "title", "organization", "department",
     "last_date", "location", "qualification",
@@ -129,31 +137,17 @@ SCORED_FIELDS = [
 ]
 
 def validate_job_data(data: dict) -> tuple[bool, str]:
-    """
-    Post-Gemini validation layer.
-    Returns (is_valid: bool, reason: str).
-
-    Rules:
-    - title must not be N/A (hard requirement)
-    - organization must not be N/A (hard requirement)
-    - At least MIN_VALID_FIELDS non-N/A values among SCORED_FIELDS
-    - last_date, if present, must be a parseable YYYY-MM-DD
-    - category must be one of the allowed values
-    """
     ALLOWED_CATEGORIES = {"latest", "admit-card", "results", "archived"}
 
-    # Hard requirements
     if not data.get("title") or data["title"] == "N/A":
         return False, "Missing required field: title"
     if not data.get("organization") or data["organization"] == "N/A":
         return False, "Missing required field: organization"
 
-    # Category check
     category = data.get("category", "")
     if category not in ALLOWED_CATEGORIES:
-        data["category"] = "latest"  # safe default
+        data["category"] = "latest"
 
-    # Date format check
     last_date_str = data.get("last_date", "N/A")
     if last_date_str != "N/A":
         try:
@@ -166,9 +160,8 @@ def validate_job_data(data: dict) -> tuple[bool, str]:
         try:
             date.fromisoformat(notif_date_str)
         except ValueError:
-            data["notification_date"] = None  # drop bad date silently
+            data["notification_date"] = None
 
-    # Minimum populated fields
     populated = sum(
         1 for f in SCORED_FIELDS
         if data.get(f) and data[f] != "N/A"
@@ -183,18 +176,11 @@ def validate_job_data(data: dict) -> tuple[bool, str]:
 
 # ─── 4. Hash-based Deduplication ───────────────────────────────────────────────
 def make_job_id(title: str, organization: str) -> str:
-    """
-    Generate a stable 16-char MD5 hash of (title|organization).
-    This is the primary key used to prevent duplicate DB entries.
-    The hash is deterministic: same job from different scrape runs
-    always produces the same ID.
-    """
     raw = f"{title.lower().strip()}|{organization.lower().strip()}"
     return hashlib.md5(raw.encode()).hexdigest()[:16]
 
 # ─── Serper Search ─────────────────────────────────────────────────────────────
 def search_jobs(query: str, num: int = 10) -> list[dict]:
-    """Call Serper API and return only results on official government domains."""
     try:
         resp = requests.post(
             "https://google.serper.dev/search",
@@ -217,7 +203,6 @@ def search_jobs(query: str, num: int = 10) -> list[dict]:
 
 # ─── Gemini Extraction ─────────────────────────────────────────────────────────
 def extract_with_gemini(snippet: str, url: str, domain: str) -> Optional[dict]:
-    """Use Gemini with the strict schema prompt; parse and return JSON or None."""
     prompt = EXTRACTION_PROMPT.format(snippet=snippet[:2000], url=url, domain=domain)
     try:
         resp = requests.post(
@@ -227,7 +212,6 @@ def extract_with_gemini(snippet: str, url: str, domain: str) -> Optional[dict]:
         )
         resp.raise_for_status()
         text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-        # Strip any accidental markdown code fences
         text = re.sub(r"```json\s*|```\s*", "", text).strip()
         return json.loads(text)
     except json.JSONDecodeError as e:
@@ -237,65 +221,36 @@ def extract_with_gemini(snippet: str, url: str, domain: str) -> Optional[dict]:
         log.error(f"Gemini extraction error for {url}: {e}")
         return None
 
-# ─── Database Operations ───────────────────────────────────────────────────────
-def get_existing_ids() -> set[str]:
-    """Fetch all existing job IDs from the DB for deduplication."""
+# ─── Edge Function Calls ───────────────────────────────────────────────────────
+def call_edge(payload: dict, timeout: int = 15) -> Optional[dict]:
+    """POST to the ingest-jobs edge function and return parsed JSON or None."""
     try:
-        resp = requests.get(
-            f"{SUPABASE_URL}/rest/v1/jobs?select=id",
-            headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-            },
-            timeout=15,
-        )
+        resp = requests.post(INGEST_URL, headers=INGEST_HEADERS, json=payload, timeout=timeout)
         resp.raise_for_status()
-        return {r["id"] for r in resp.json()}
+        return resp.json()
     except Exception as e:
-        log.error(f"Failed to fetch existing IDs: {e}")
-        return set()
+        log.error(f"Edge function call failed (action={payload.get('action')}): {e}")
+        return None
+
+def get_existing_ids() -> set[str]:
+    result = call_edge({"action": "get_ids"})
+    if result and result.get("success"):
+        return set(result.get("ids", []))
+    return set()
 
 def archive_expired_jobs():
-    """Patch all jobs whose last_date has passed to status=expired."""
-    today_str = date.today().isoformat()
-    try:
-        resp = requests.patch(
-            f"{SUPABASE_URL}/rest/v1/jobs?last_date=lt.{today_str}&status=neq.expired",
-            headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type": "application/json",
-                "Prefer": "return=minimal",
-            },
-            json={"status": "expired", "category": "archived"},
-            timeout=15,
-        )
-        log.info(f"Archived expired jobs: HTTP {resp.status_code}")
-    except Exception as e:
-        log.error(f"Failed to archive expired jobs: {e}")
+    result = call_edge({"action": "archive_expired"})
+    if result and result.get("success"):
+        log.info("Archived expired jobs via edge function ✓")
+    else:
+        log.error("Failed to archive expired jobs")
 
 def upsert_job(job_data: dict) -> bool:
-    """Insert a job row; silently ignores if the ID already exists."""
-    try:
-        resp = requests.post(
-            f"{SUPABASE_URL}/rest/v1/jobs",
-            headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type": "application/json",
-                "Prefer": "resolution=ignore-duplicates",
-            },
-            json=job_data,
-            timeout=15,
-        )
-        return resp.status_code in (200, 201)
-    except Exception as e:
-        log.error(f"Failed to upsert job: {e}")
-        return False
+    result = call_edge({"action": "upsert", "job": job_data})
+    return bool(result and result.get("success"))
 
 # ─── Status Helper ─────────────────────────────────────────────────────────────
 def compute_status(last_date_str: str) -> str:
-    """Derive active / expiring / expired from the last application date."""
     if last_date_str == "N/A" or not last_date_str:
         return "active"
     try:
@@ -312,9 +267,10 @@ def compute_status(last_date_str: str) -> str:
 def main():
     log.info("=" * 60)
     log.info("Sarkari Job Scraper started")
-    log.info(f"Run time : {datetime.now().isoformat()}")
-    log.info(f"Domain whitelist : {ALLOWED_DOMAINS}")
-    log.info(f"Min valid fields : {MIN_VALID_FIELDS}")
+    log.info(f"Run time       : {datetime.now().isoformat()}")
+    log.info(f"Domain whitelist: {ALLOWED_DOMAINS}")
+    log.info(f"Min valid fields: {MIN_VALID_FIELDS}")
+    log.info(f"Ingest endpoint : {INGEST_URL}")
     log.info("=" * 60)
 
     # Step 1: Archive expired jobs
@@ -351,34 +307,34 @@ def main():
         domain  = extract_domain(url)
         snippet = f"{result.get('title', '')} {result.get('snippet', '')}"
 
-        # ── Guard 1: domain whitelist (double-check after search filter) ──
+        # ── Guard 1: domain whitelist ──────────────────────────────────────────
         if not is_official_domain(url):
             log.warning(f"[DOMAIN REJECTED] {url}")
             skipped_domain += 1
             continue
 
-        # ── Gemini extraction ──────────────────────────────────────────────
+        # ── Gemini extraction ──────────────────────────────────────────────────
         extracted = extract_with_gemini(snippet, url, domain)
         if not extracted:
             log.warning(f"[GEMINI FAILED] {url}")
             error_count += 1
             continue
 
-        # ── Guard 2: post-extraction validation layer ─────────────────────
+        # ── Guard 2: post-extraction validation layer ──────────────────────────
         is_valid, reason = validate_job_data(extracted)
         if not is_valid:
             log.warning(f"[VALIDATION FAILED] {reason} | {url}")
             skipped_valid += 1
             continue
 
-        # ── Guard 3: hash-based deduplication ─────────────────────────────
+        # ── Guard 3: hash-based deduplication ─────────────────────────────────
         job_id = make_job_id(extracted["title"], extracted["organization"])
         if job_id in existing_ids:
             log.debug(f"[DUPLICATE] {extracted['title'][:60]}")
             skipped_dup += 1
             continue
 
-        # ── Build DB row ───────────────────────────────────────────────────
+        # ── Build DB row ───────────────────────────────────────────────────────
         last_date_str = extracted.get("last_date", "N/A")
         notif_date    = extracted.get("notification_date")
         if notif_date == "N/A":
