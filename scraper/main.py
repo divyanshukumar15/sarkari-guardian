@@ -1,6 +1,6 @@
 """
-Sarkari Job Scraper
-====================
+Sarkari Job Scraper  v1.0
+==========================
 Uses Serper API (Google Search) to discover new government job notifications,
 then Gemini AI to extract structured job data with strict accuracy validation.
 
