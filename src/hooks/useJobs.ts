@@ -2,15 +2,58 @@ import { useQuery } from '@tanstack/react-query';
 import { supabase } from '@/integrations/supabase/client';
 import { Job, JobCategory } from '@/types/job';
 
-const fetchJobs = async (): Promise<Job[]> => {
-  const { data, error } = await supabase
-    .from('jobs')
-    .select('*')
-    .order('created_at', { ascending: false })
-    .limit(500);
+const normalizeJob = (job: Partial<Job> & Record<string, unknown>): Job => ({
+  id: String(job.id ?? ''),
+  title: String(job.title ?? 'N/A'),
+  organization: String(job.organization ?? 'N/A'),
+  department: String(job.department ?? 'N/A'),
+  category: (job.category ?? 'latest') as JobCategory,
+  status: (job.status ?? 'active') as Job['status'],
+  posts: String(job.posts ?? 'N/A'),
+  last_date: (job.last_date as string | null) ?? null,
+  notification_date: (job.notification_date as string | null) ?? null,
+  source_url: (job.source_url as string | null) ?? null,
+  source_domain: (job.source_domain as string | null) ?? null,
+  is_verified_source: Boolean(job.is_verified_source),
+  location: String(job.location ?? 'N/A'),
+  qualification: String(job.qualification ?? 'N/A'),
+  age_limit: String(job.age_limit ?? 'N/A'),
+  salary: String(job.salary ?? 'N/A'),
+  tags: Array.isArray(job.tags) ? (job.tags as string[]) : [],
+  scraped_at: (job.scraped_at as string | null) ?? null,
+  created_at: String(job.created_at ?? new Date().toISOString()),
+});
 
-  if (error) throw error;
-  return (data ?? []) as Job[];
+const fetchFromPublicFunction = async (): Promise<Job[]> => {
+  const baseUrl = import.meta.env.VITE_SUPABASE_URL;
+  if (!baseUrl) throw new Error('Backend URL is missing');
+
+  const res = await fetch(`${baseUrl}/functions/v1/public-jobs`);
+  if (!res.ok) throw new Error(`Fallback fetch failed: ${res.status}`);
+
+  const payload = await res.json();
+  const rows = Array.isArray(payload?.jobs) ? payload.jobs : [];
+  return rows.map((row) => normalizeJob(row));
+};
+
+const fetchJobs = async (): Promise<Job[]> => {
+  try {
+    const { data, error } = await supabase
+      .from('jobs')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(500);
+
+    if (error) throw error;
+    return (data ?? []).map((row) => normalizeJob(row as Partial<Job> & Record<string, unknown>));
+  } catch (primaryError) {
+    try {
+      return await fetchFromPublicFunction();
+    } catch (fallbackError) {
+      console.error('Failed loading jobs from primary and fallback sources', { primaryError, fallbackError });
+      throw fallbackError;
+    }
+  }
 };
 
 export const useJobs = () => {
