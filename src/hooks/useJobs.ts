@@ -26,6 +26,27 @@ const normalizeJob = (job: Partial<Job> & Record<string, unknown>): Job => ({
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+// XHR-based fetch to bypass lovable.js fetch proxy
+const xhrFetch = (url: string, headers?: Record<string, string>): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', url, true);
+    if (headers) {
+      Object.entries(headers).forEach(([k, v]) => xhr.setRequestHeader(k, v));
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(xhr.responseText);
+      } else {
+        reject(new Error(`XHR failed: ${xhr.status}`));
+      }
+    };
+    xhr.onerror = () => reject(new Error('XHR network error'));
+    xhr.ontimeout = () => reject(new Error('XHR timeout'));
+    xhr.timeout = 15000;
+    xhr.send();
+  });
+
 const fetchWithRetry = async (url: string, options: RequestInit, retries = 3): Promise<Response> => {
   for (let i = 0; i < retries; i++) {
     try {
@@ -71,6 +92,34 @@ const fetchFromRest = async (): Promise<Job[]> => {
   return (Array.isArray(data) ? data : []).map((row: Record<string, unknown>) => normalizeJob(row as Partial<Job> & Record<string, unknown>));
 };
 
+// XHR-based strategies that bypass the fetch proxy
+const fetchViaXhrRest = async (): Promise<Job[]> => {
+  const baseUrl = import.meta.env.VITE_SUPABASE_URL;
+  const anonKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+  if (!baseUrl || !anonKey) throw new Error('Config missing');
+
+  const text = await xhrFetch(
+    `${baseUrl}/rest/v1/jobs?select=*&order=created_at.desc&limit=500`,
+    {
+      apikey: anonKey,
+      Authorization: `Bearer ${anonKey}`,
+      'Accept-Profile': 'public',
+    },
+  );
+  const data = JSON.parse(text);
+  return (Array.isArray(data) ? data : []).map((row: Record<string, unknown>) => normalizeJob(row as Partial<Job> & Record<string, unknown>));
+};
+
+const fetchViaXhrEdge = async (): Promise<Job[]> => {
+  const baseUrl = import.meta.env.VITE_SUPABASE_URL;
+  if (!baseUrl) throw new Error('Backend URL is missing');
+
+  const text = await xhrFetch(`${baseUrl}/functions/v1/public-jobs`);
+  const payload = JSON.parse(text);
+  const rows = Array.isArray(payload?.jobs) ? payload.jobs : [];
+  return rows.map((row) => normalizeJob(row));
+};
+
 const fetchJobs = async (): Promise<Job[]> => {
   // Strategy 1: Supabase JS client
   try {
@@ -85,21 +134,35 @@ const fetchJobs = async (): Promise<Job[]> => {
       return data.map((row) => normalizeJob(row as Partial<Job> & Record<string, unknown>));
     }
   } catch (e) {
-    console.warn('Primary fetch failed, trying fallbacks…', e);
+    console.warn('Strategy 1 (Supabase client) failed:', e);
   }
 
-  // Strategy 2: Direct REST API with retry
+  // Strategy 2: XHR REST (bypasses lovable.js fetch proxy)
+  try {
+    return await fetchViaXhrRest();
+  } catch (e) {
+    console.warn('Strategy 2 (XHR REST) failed:', e);
+  }
+
+  // Strategy 3: XHR Edge Function
+  try {
+    return await fetchViaXhrEdge();
+  } catch (e) {
+    console.warn('Strategy 3 (XHR Edge) failed:', e);
+  }
+
+  // Strategy 4: Direct REST API with fetch
   try {
     return await fetchFromRest();
   } catch (e) {
-    console.warn('REST fallback failed, trying edge function…', e);
+    console.warn('Strategy 4 (fetch REST) failed:', e);
   }
 
-  // Strategy 3: Edge function with retry
+  // Strategy 5: Edge function with fetch
   try {
     return await fetchFromPublicFunction();
   } catch (e) {
-    console.error('All fetch strategies failed', e);
+    console.error('All 5 fetch strategies failed', e);
     throw e;
   }
 };
