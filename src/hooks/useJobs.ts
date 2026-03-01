@@ -24,11 +24,26 @@ const normalizeJob = (job: Partial<Job> & Record<string, unknown>): Job => ({
   created_at: String(job.created_at ?? new Date().toISOString()),
 });
 
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const fetchWithRetry = async (url: string, options: RequestInit, retries = 3): Promise<Response> => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetch(url, options);
+      return res;
+    } catch (err) {
+      if (i === retries - 1) throw err;
+      await delay(1000 * (i + 1));
+    }
+  }
+  throw new Error('fetchWithRetry exhausted');
+};
+
 const fetchFromPublicFunction = async (): Promise<Job[]> => {
   const baseUrl = import.meta.env.VITE_SUPABASE_URL;
   if (!baseUrl) throw new Error('Backend URL is missing');
 
-  const res = await fetch(`${baseUrl}/functions/v1/public-jobs`);
+  const res = await fetchWithRetry(`${baseUrl}/functions/v1/public-jobs`, {});
   if (!res.ok) throw new Error(`Fallback fetch failed: ${res.status}`);
 
   const payload = await res.json();
@@ -36,7 +51,28 @@ const fetchFromPublicFunction = async (): Promise<Job[]> => {
   return rows.map((row) => normalizeJob(row));
 };
 
+const fetchFromRest = async (): Promise<Job[]> => {
+  const baseUrl = import.meta.env.VITE_SUPABASE_URL;
+  const anonKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+  if (!baseUrl || !anonKey) throw new Error('Config missing');
+
+  const res = await fetchWithRetry(
+    `${baseUrl}/rest/v1/jobs?select=*&order=created_at.desc&limit=500`,
+    {
+      headers: {
+        apikey: anonKey,
+        Authorization: `Bearer ${anonKey}`,
+        'Accept-Profile': 'public',
+      },
+    },
+  );
+  if (!res.ok) throw new Error(`REST fetch failed: ${res.status}`);
+  const data = await res.json();
+  return (Array.isArray(data) ? data : []).map((row: Record<string, unknown>) => normalizeJob(row as Partial<Job> & Record<string, unknown>));
+};
+
 const fetchJobs = async (): Promise<Job[]> => {
+  // Strategy 1: Supabase JS client
   try {
     const { data, error } = await supabase
       .from('jobs')
@@ -45,14 +81,26 @@ const fetchJobs = async (): Promise<Job[]> => {
       .limit(500);
 
     if (error) throw error;
-    return (data ?? []).map((row) => normalizeJob(row as Partial<Job> & Record<string, unknown>));
-  } catch (primaryError) {
-    try {
-      return await fetchFromPublicFunction();
-    } catch (fallbackError) {
-      console.error('Failed loading jobs from primary and fallback sources', { primaryError, fallbackError });
-      throw fallbackError;
+    if (data && data.length > 0) {
+      return data.map((row) => normalizeJob(row as Partial<Job> & Record<string, unknown>));
     }
+  } catch (e) {
+    console.warn('Primary fetch failed, trying fallbacks…', e);
+  }
+
+  // Strategy 2: Direct REST API with retry
+  try {
+    return await fetchFromRest();
+  } catch (e) {
+    console.warn('REST fallback failed, trying edge function…', e);
+  }
+
+  // Strategy 3: Edge function with retry
+  try {
+    return await fetchFromPublicFunction();
+  } catch (e) {
+    console.error('All fetch strategies failed', e);
+    throw e;
   }
 };
 
@@ -60,8 +108,10 @@ export const useJobs = () => {
   return useQuery<Job[]>({
     queryKey: ['jobs'],
     queryFn: fetchJobs,
-    staleTime: 5 * 60 * 1000, // 5 min
+    staleTime: 5 * 60 * 1000,
     refetchOnWindowFocus: false,
+    retry: 3,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 10000),
   });
 };
 
